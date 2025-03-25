@@ -1,0 +1,555 @@
+---
+title: "STA437Project"
+author: "Thanh Huy Dang, Hojung Kim"
+date: "`r Sys.Date()`"
+output: pdf_document
+fontsize: 12pt
+linestretch: 1.15
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(scales)
+library(patchwork)
+```
+
+# Introduction
+Credit default swap (CDS) spreads are valid and readily available indicators of creditworthiness of individual companies and the economy as a whole.
+Spreads at different tenors are quoted daily.
+
+Multivariate methods are attractive options to analyse this data set because we expect they can extract the historical behaviour of the CDS spreads at different tenors (considering them as variables), as well as the correlation structure among the CDS spreads for different pairs of companies.
+
+In this report, we address two main questions.
+
+First, we investigate how market volatility affects the aggregate CDS curve of all companies (and the curve of Exxon Mobil Corp in particular) and whether this effect is different for the periods before and during COVID.
+
+Second, we expect stronger correlation in daily CDS spreads changes between companies within the same sector.
+In particular, we investigate whether there is a difference in how changes in CDS spreads of Exxon Mobil Corp relate to that of Chevron Corp (energy sector) and that of American Express (finance sector).
+
+The multivariate methods employed in this report are Principal Component Analysis (PCA) and Canonical Correlation Analysis (CCA).
+
+PCA is applied to the daily changes in CDS spreads to investigate the behaviour of the CDS curve.
+In particular, we would like to observe how the spreads at different tenors move relative to each other when there is a change in the direction of each significant principal component.
+
+CCA is applied to the daily changes in CDS spreads for the two pairs of companies (Exxon Mobil Corp vs Chevron Corp, and Exxon Mobil Corp vs American Express) to investigate the degree in which they are correlated.
+
+\newpage
+# Data and Preprocessing
+
+## Data Description
+This dataset contains CDS spreads for various companies across 10 different tenors, labeled PX1 to PX10.
+Each row represents the CDS spreads for a specific company on a specific date.
+
+There is a summary table of the dataset, which includes key statistics such as mean and range for each tenor.
+Relevant histograms are also included to illustrate the distribution of CDS spreads as well as their differences.
+For histogram of CDS spreads frequency within each tenor, I took normalization and excluded extreme CDS spreads due to the visibility.
+
+## Data Cleaning
+There are no missing values in the dataset, so no imputation or row removal was necessary.
+
+## Transformations
+Several transformations were applied during preprocessing.
+
+First, we computed the first difference of each tenor series within each company.
+This transformation captures daily changes in credit risk, allowing us to focus on the dynamics of risk rather than absolute CDS levels.
+
+Second, we applied normalization to the differenced data before performing PCA.
+This step ensures that each tenor contributes equally to the analysis regardless of scale.
+
+```{r data_load, include=FALSE}
+load("C:/Users/sprin/MSc/STA437/CDS_data.RData")
+
+# Get company identifiers
+companies <- unique(data$Company)
+
+# Initialize list to store per-company differenced data
+cds_diff_list <- list()
+
+for (company in companies) {
+  company_data <- data %>% filter(Company == company) %>% arrange(Date)
+  company_spreads <- company_data[, grep("PX", names(company_data))]
+  
+  # Compute row-wise diff
+  if (nrow(company_spreads) > 1) {
+    diff_spreads <- apply(company_spreads, 2, diff)
+    cds_diff_list[[company]] <- diff_spreads
+  }
+}
+
+cds_diff <- do.call(rbind, cds_diff_list)
+```
+
+```{r all_company_data_preprocess, echo=FALSE}
+cds_spreads <- data[, grep("PX", names(data))]
+summary(cds_spreads)
+# summary(cds_diff)
+
+# Normalization
+scaled_cdf <- scale(cds_spreads)
+scaled_cdf_diff <- scale(cds_diff)
+
+# Histograms
+## Histogram of original CDS spreads after normalization
+par(mfrow = c(3, 4))
+
+for (i in 1:10) {
+  values <- scaled_cdf[, i]
+  trimmed <- values[values > -5 & values < 5]  # filter out extreme values
+  hist(trimmed,
+       main = paste("Histogram of PX", i, sep=""),
+       xlab = "Normalized Spread",
+       col = "lightblue",
+       breaks = 30)
+}
+
+## Histogram of first order differenced CDS score
+par(mfrow = c(3, 4))
+
+for (i in 1:10) {
+  values <- scaled_cdf_diff[, i]
+  trimmed <- values[values > -1 & values < 1]  # filter out extreme values
+  hist(trimmed,
+       main = paste("Histogram of PX", i, sep=""),
+       xlab = "Normalized Spread",
+       col = "lightblue",
+       breaks = 30)
+}
+```
+
+\newpage
+# Methodology
+
+## PCA Across All Companies
+To ensure that our PCA reflects the collective behavior of CDS spreads and is not overly influenced by any single firm, we examined the distribution of average standard deviation across companies.
+The histogram shows a tightly concentrated distribution, with most companies exhibiting low to moderate spread variability.
+While a few companies have notably higher variability, the bulk of the distribution suggests that no company overwhelmingly dominates the CDS data.
+This supports the validity of applying PCA across the entire dataset.
+
+```{r all_company_dominant_checking, echo=FALSE, warning=FALSE, fig.width=5, fig.height=3.57}
+
+# Compute standard deviation of each PX per company
+company_sd <- data %>%
+  group_by(Company) %>%
+  summarize(across(starts_with("PX"), sd, na.rm = TRUE)) %>%
+  rowwise() %>%
+  mutate(avg_sd = mean(c_across(starts_with("PX")), na.rm = TRUE))
+
+# Plot histogram of average spread SD per company
+ggplot(company_sd, aes(x = avg_sd)) +
+  geom_histogram(fill = "skyblue", color = "black", bins = 40) +
+  labs(
+    title = "Distribution of Average CDS Spread Std Dev per Company",
+    x = "Average Standard Deviation",
+    y = "Number of Companies"
+  ) +
+  theme_minimal()
+```
+
+We perform a first difference on the CDS spreads of all companies to find the daily changes at all ten tenors.
+The daily changes are normalized to account for differences in scales.
+We then conduct PCA on this data to find the principal components (i.e. the eigenvectors of the sample variance matrix).
+A scree plot is created to inspect how much of the variance is explained by the principal components, and how many principal components we should investigate more closely.
+
+We add (and subtract) the scaled (by a factor of 20) principal components to the mean CDS curve to study the effect on the CDS curve from a change in the direction of each principal component.
+The scaling is to magnify the effects for better visualization in our CDS curve plots.
+
+Finally, the above procedure is repeated separately for the data from before the COVID pandemic (before March 2020) and the data during the COVID pandemic to observe if the behaviour of the CDS curve is different in these two periods.
+
+## PCA on Exxon Mobil Corp
+In the next part of our analysis, we place our focus on Exxon Mobil Corp (Exxon).
+The steps above are repeated for this company to observe if its CDS curve behaves differently from the results we obtain from the whole group of companies.
+
+We also investigate the case when there is a change in all the significant principal directions (proportioned by the percentage of variance explained).
+
+## Canonical Correlation Analysis (CCA)
+Next, we obtain the daily changes for Chevron and American Express and pairing them with the Exxon data to conduct CCA.
+
+We plot two curves of canonical correlations for the two pairs respectively to investigate whether there are differences in how the spreads in each pair move together.
+Specifically, we want to see if the first few canonical correlations appear very different for the two pairs.
+Larger canonical correlations indicate that changes in CDS spreads of that particular pair of companies are more closely related.
+
+\newpage
+# Results
+
+## PCA on All Companies
+With regards to daily changes of CDS spreads of all companies, 90% of the total variance is explained by PC1, and 9% by PC2.
+The remaining principal components contribute minimally to the variance.
+This is apparent from the Scree plot.
+
+```{r all_company_pca, echo=FALSE, fig.width=5, fig.height=3.57}
+# PCA
+pca_result <- prcomp(cds_diff, scale. = TRUE)
+summary(pca_result)
+
+scree_values <- summary(pca_result)$importance[2, ] * 100  # percentage
+plot(scree_values,
+     type = "o",  # line + points
+     lwd = 1.5,
+     main = "Scree Plot",
+     xlab = "Principal Component",
+     ylab = "Percentage of Variance Explained",
+     xaxt = "n")
+abline(v = 3, lty = 2)
+axis(1, at = 1:length(scree_values), labels = paste0("PC", 1:length(scree_values)))
+```
+
+The figure below shows the first 3 PCs across all tenors.
+For PC1, we can see that all tenors share similar small negative values.
+It means that if there is a change in the direction of PC1, CDS spreads will be increased or decreased by a similar amount across all maturities.
+Since PC1 explains 90% of the total variance, we can safely assume that the dominant movement in CDS spreads is a parallel shift.
+
+Observe the signs of the entries in the second principal component — they change from negative to positive at PX5.
+It means that short-term and long-term tenor CDS spreads move in opposite directions.
+
+This might explain why during a financial crisis, short-term risk increases and so does the cost of protection for immediate risk of default.
+On the contrary, stable market conditions should imply higher cost of protection for potential default further in the future.
+
+```{r all_company_evec, echo=FALSE, fig.width=5, fig.height=3.57}
+# Extract first 3 principal components
+loading_matrix <- pca_result$rotation[, 1:3]
+
+# Convert to long format for ggplot
+loadings <- as.data.frame(loading_matrix)
+loadings$Tenor <- rownames(loadings)  # e.g., PX1, PX2, ..., PX10
+loadings <- pivot_longer(loadings, cols = starts_with("PC"),
+                         names_to = "Component", values_to = "Loading")
+
+loadings$Tenor <- factor(loadings$Tenor, levels = paste0("PX", 1:10))
+
+# ggplot
+ggplot(loadings, aes(x = Tenor, y = Loading, color = Component, group = Component)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Loadings of PC1, PC2, and PC3",
+       x = "Tenor",
+       y = "Loading") +
+  scale_y_continuous(
+    breaks = seq(-0.6, 0.6, by = 0.2),
+    labels = label_number(accuracy = 0.1)  # Avoid scientific notation
+  ) +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+```
+
+By adding and subtracting PC1 and PC2 from the mean CDS curve, we can visualize how each component affects the shape of the CDS term structure.
+This reinforces our interpretation of the loadings for each tenor.
+
+As shown in the graph, adding or subtracting PC1 causes a uniform upward or downward shift across all tenors.
+This reflects a parallel shift, which aligns with our earlier interpretation of PC1 as capturing overall market-wide movements in CDS spreads.
+
+When we add or subtract PC2, we observe that an increase in PC2 raises long-term spreads while lowering short-term spreads.
+Conversely, a decrease in PC2 increases short-term spreads and lowers long-term spreads.
+This demonstrates that PC2 drives the steepening or flattening of the CDS curve, consistent with the interpretation of PC2 representing changes in the slope of the term structure.
+
+```{r all_company_evec_visualize, echo=FALSE}
+# Extract only PX columns from the original data (not differenced)
+cds_spreads <- data[, grep("PX", names(data))]
+
+# Compute the average CDS curve across all companies and dates
+mean_cds <- colMeans(cds_spreads, na.rm = TRUE)
+
+scale_factor <- 20
+
+# Create data frame for plotting
+cds_df <- tibble(
+  Tenor = paste0("PX", 1:10),
+  Mean = mean_cds,
+  PC1_plus = mean_cds + scale_factor * pca_result$rotation[,1],
+  PC1_minus = mean_cds - scale_factor * pca_result$rotation[,1],
+  PC2_plus = mean_cds + scale_factor * pca_result$rotation[,2],
+  PC2_minus = mean_cds - scale_factor * pca_result$rotation[,2]
+)
+
+# Long format for PC1 plot
+pc1_df <- cds_df %>%
+  select(Tenor, Mean, PC1_plus, PC1_minus) %>%
+  pivot_longer(-Tenor, names_to = "Curve", values_to = "Spread")%>%
+  mutate(Curve = recode(Curve,
+                        "Mean" = "Mean",
+                        "PC1_plus" = "Mean + PC1",
+                        "PC1_minus" = "Mean - PC1"))
+
+# Long format for PC2 plot
+pc2_df <- cds_df %>%
+  select(Tenor, Mean, PC2_plus, PC2_minus) %>%
+  pivot_longer(-Tenor, names_to = "Curve", values_to = "Spread")%>%
+  mutate(Curve = recode(Curve,
+                        "Mean" = "Mean",
+                        "PC2_plus" = "Mean + PC2",
+                        "PC2_minus" = "Mean - PC2"))
+
+# Ensure correct order
+pc1_df$Tenor <- factor(pc1_df$Tenor, levels = paste0("PX", 1:10))
+pc2_df$Tenor <- factor(pc2_df$Tenor, levels = paste0("PX", 1:10))
+
+# PC1 plot
+p1 <- ggplot(pc1_df, aes(x = Tenor, y = Spread, color = Curve, linetype = Curve, group = Curve)) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Mean CDS Curve ± PC1", x = "Tenor", y = "CDS Spread") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom")
+
+# PC2 plot
+p2 <- ggplot(pc2_df, aes(x = Tenor, y = Spread, color = Curve, linetype = Curve, group = Curve)) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Mean CDS Curve ± PC2", x = "Tenor", y = "CDS Spread") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom")
+
+# Combine
+(p1 + p2) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+```
+
+## Comparison: Before vs During COVID
+
+Now we attempt to compare and contrast the CDS spreads behaviour in the periods before and during the COVID pandemic.
+
+We observe that during the second period, the first principal component contributes more to the total variance.
+It means the CDS spreads at all tenors shift together more strongly during COVID.
+The second principal component consequently contributes less, signifying that relative movements of short- and long-term risks are secondary to overall general risk.
+
+In the graph comparing pre-COVID and during-COVID time’s eigenvectors of PC1, PC2, and PC3, we can also check that PC1 has higher loadings during COVID, which means CDS scores increased in a broad fashion.
+
+PC2’s slope change is also notable:
+
+* During COVID, investors thought short term was riskier and expected long-term stability.
+* This contrasts with the pre-COVID period, where investors were confident in short-term risk but more uncertain about the long term.
+
+As shown in the graph, adding or subtracting PC1 causes a uniform upward or downward shift across all tenors.
+This reflects a parallel shift, which aligns with our earlier interpretation of PC1.
+
+When we add or subtract PC2, we observe:
+
+* An increase in PC2 raises long-term spreads while lowering short-term spreads.
+* A decrease in PC2 increases short-term spreads and lowers long-term spreads.
+
+This demonstrates that PC2 drives the steepening or flattening of the CDS curve, consistent with it representing changes in the slope of the term structure.
+
+```{r all_company_covid, echo=FALSE}
+# Define pre-COVID and during-COVID periods
+pre_covid <- subset(data, Date < as.Date("2020-03-01"))
+during_covid <- subset(data, Date >= as.Date("2020-03-01"))
+
+# First order differenciate of CDS by company
+get_cds_diff_by_company <- function(df) {
+  companies <- unique(df$Company)
+  cds_diff_list <- list()
+  
+  for (company in companies) {
+    company_data <- df %>% filter(Company == company) %>% arrange(Date)
+    cds_cols <- company_data[, grep("PX", names(company_data))]
+    
+    if (nrow(cds_cols) > 1) {
+      diff_data <- apply(cds_cols, 2, diff)
+      cds_diff_list[[company]] <- diff_data
+    }
+  }
+  
+  do.call(rbind, cds_diff_list)
+}
+
+pre_cds_diff <- get_cds_diff_by_company(pre_covid)
+during_cds_diff <- get_cds_diff_by_company(during_covid)
+
+pca_pre <- prcomp(pre_cds_diff, scale. = TRUE)
+pca_during <- prcomp(during_cds_diff, scale. = TRUE)
+
+# Prepare data for plotting
+tenors <- paste0("PX", 1:10)
+
+pre_loadings <- as.data.frame(pca_pre$rotation[, 1:3])
+pre_loadings$Tenor <- factor(tenors, levels = tenors)
+pre_loadings_long <- pivot_longer(pre_loadings, -Tenor, names_to = "Component", values_to = "Loading")
+
+during_loadings <- as.data.frame(pca_during$rotation[, 1:3])
+during_loadings$Tenor <- factor(tenors, levels = tenors)
+during_loadings_long <- pivot_longer(during_loadings, -Tenor, names_to = "Component", values_to = "Loading")
+
+# Pre-COVID plot
+pre_plot <- ggplot(pre_loadings_long, aes(x = Tenor, y = Loading, color = Component, group = Component)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Pre-COVID: Loadings of PC1,2,3",
+       x = "Tenor",
+       y = "Loading") +
+  scale_y_continuous(breaks = seq(-0.6, 0.6, by = 0.2), labels = label_number(accuracy = 0.1)) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# During-COVID plot
+during_plot <- ggplot(during_loadings_long, aes(x = Tenor, y = Loading, color = Component, group = Component)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "During-COVID: Loadings of PC1,2,3",
+       x = "Tenor",
+       y = "Loading") +
+  scale_y_continuous(breaks = seq(-0.6, 0.6, by = 0.2), labels = label_number(accuracy = 0.1)) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine and display
+pre_plot + during_plot
+
+```
+
+## PCA on Exxon Mobil Corp
+With regards to the case of Exxon, the Scree plot indicates that most of the variance in the daily changes of CDS rates is explained by the first three principal components, so we decide to focus on them.
+
+```{r exxon_pca, echo=FALSE, fig.width=5, fig.height=3.57}
+my_data <- data[data$Company == "Exxon Mobil Corp",]
+rates <- subset(my_data, select=c("PX1", "PX2", "PX3", "PX4", "PX5", "PX6", "PX7", "PX8", "PX9", "PX10"))
+mean_curve <- colMeans(rates) # original CDS rates curve
+
+# daily changes in CDS rates (all 10 tenors)
+rates_diff <- matrix(rep(0, 10*nrow(rates) - 10), ncol = 10)
+for (i in 1:10){
+  dif <- diff(rates[,i])
+  rates_diff[,i] <- dif
+}
+
+rates_diff <- scale(rates_diff) # normalize data
+pca <- prcomp(rates_diff) # perform pca
+# summary(pca) # eigenvalues and variance explained
+# pca$rotation # eigenvectors 
+
+### Scree plot
+var_explained = pca$sdev^2 / sum(pca$sdev^2)
+plot(var_explained, type = "o", lwd = 1.5, ylab = "Variance explained")
+abline(v = 3, lty = 2) # 3 eigenvectors are enough
+title(main = "Scree plot")
+```
+
+* The first principal component has negative values for all entries, ranging between -0.25 and -0.35 approximately.
+Hence, a change in this direction may increase or decrease the CDS rates at all tenors by roughly the same amount.
+Figure shows an approximately parallel shift in the CDS curve.
+
+* The entries of the second principal component are decreasing.
+A change in this direction may increase or decrease the slope of the CDS curve.
+This is because the rates are adjusted to a larger extent (and in opposite directions) at the shorter and longer tenors, but are only adjusted minimally at the medium tenors.
+Figure illustrates this behaviour.
+
+* The entries of the third principal component are increasing and then decreasing.
+A change in this direction may increase or decrease the convexity of the CDS curve.
+The resulting curve after the change will intersect the original curve at two points, as illustrated in Figure.
+
+```{r exxon_evec, echo=FALSE, fig.width=5, fig.height=3.57}
+# Prepare data
+tenors <- paste0("PX", 1:10)
+pc_loadings <- as.data.frame(pca$rotation[, 1:3])
+pc_loadings$Tenor <- factor(tenors, levels = tenors)
+
+# Convert to long format
+pc_loadings_long <- pivot_longer(pc_loadings, -Tenor, names_to = "Component", values_to = "Loading")
+
+# Plot using ggplot2
+ggplot(pc_loadings_long, aes(x = Tenor, y = Loading, color = Component, group = Component)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Principal Components",
+       x = "Tenor",
+       y = "Loading") +
+  scale_y_continuous(breaks = seq(-0.6, 0.6, 0.2),
+                     labels = label_number(accuracy = 0.1)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+```
+
+When effecting changes in all three principal directions at the same time (in proportion with the respective percentages of variance explained), we see that the CDS curve shifts in a parallel manner.
+This is expected because the Scree plot indicates close to 90% of the variance is explained by the first principal component.
+We note, however, that the CDS rates at shorter tenors appear to be shifted by a smaller extent compared to the longer tenors.
+
+```{r exxon_evec_visualize, echo=FALSE}
+# PC1-adjusted curves
+pc1_df <- tibble(
+  Tenor = factor(tenors, levels = tenors),
+  Mean = mean_curve,
+  PC1_plus = mean_curve + 20 * pca$rotation[, 1],
+  PC1_minus = mean_curve - 20 * pca$rotation[, 1]
+) %>%
+  pivot_longer(-Tenor, names_to = "Curve", values_to = "Spread")%>%
+  mutate(Curve = recode(Curve,
+                        "Mean" = "Mean",
+                        "PC1_plus" = "Mean + PC1",
+                        "PC1_minus" = "Mean - PC1"))
+
+# PC2-adjusted curves
+pc2_df <- tibble(
+  Tenor = factor(tenors, levels = tenors),
+  Mean = mean_curve,
+  PC2_plus = mean_curve + 20 * pca$rotation[, 2],
+  PC2_minus = mean_curve - 20 * pca$rotation[, 2]
+) %>%
+  pivot_longer(-Tenor, names_to = "Curve", values_to = "Spread")%>%
+  mutate(Curve = recode(Curve,
+                        "Mean" = "Mean",
+                        "PC2_plus" = "Mean + PC2",
+                        "PC2_minus" = "Mean - PC2"))
+
+# Plot for PC1
+p1 <- ggplot(pc1_df, aes(x = Tenor, y = Spread, color = Curve, linetype = Curve, group = Curve)) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Mean CDS Curve ± PC1",
+       x = "Tenor",
+       y = "CDS Spread") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+# Plot for PC2
+p2 <- ggplot(pc2_df, aes(x = Tenor, y = Spread, color = Curve, linetype = Curve, group = Curve)) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Mean CDS Curve ± PC2",
+       x = "Tenor",
+       y = "CDS Spread") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+# Combine and display
+(p1 + p2) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+```
+
+## Exxon: Before vs During COVID
+We separate the data for Exxon into the “Before COVID” and “During COVID” portions.
+
+The results obtained are largely similar to the case where we investigate it as a whole.
+The first three principal components explain most of the variance, with the first one dominating the others (close to 90% in both datasets).
+The behaviour of the CDS curve in response to changes in the principal directions are as described above.
+
+However, the change in the convexity of the CDS curve is not as obvious with the “During COVID” data.
+These results are summarized in Figure and Figure.
+
+## Canonical Correlation Analysis
+The first three canonical correlations for the CDS rates of Exxon and Chevron are 0.34, 0.19, 0.17
+
+These numbers for Exxon and American Express are 0.29. 0.15, 0.10
+which are smaller in magnitude.
+
+This is not very surprising since Exxon and Chevron are from the energy sector while American Express is from the finance sector.
+
+However, as seen in the figure, the differences are not very substantial.
+So it is likely that macroeconomic factors at large may have very strong influence on the CDS rates of individual companies (especially with regards to these three mature successful companies), relative to sector-specific factors.
